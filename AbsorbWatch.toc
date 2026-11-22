@@ -1,0 +1,7 @@
+## Interface: 16001
+## Title: AbsorbWatch
+## Notes: Shows your current total damage absorb (secret-value safe, works in combat).
+## Version: 0.3.0
+## SavedVariables: AbsorbWatchDB
+
+AbsorbWatch.lua
