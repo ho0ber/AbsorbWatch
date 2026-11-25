@@ -16,7 +16,18 @@ local DEFAULTS = {
   edge = true,              -- bright line at the leading edge of the bar
   text = true,              -- number to the right of the player health bar
   raid = true,              -- also draw bars on raid frames and raid-style party frames
+  popSound = "BubblePop",   -- sound when your absorb runs out ("Off" to disable)
+  popChannel = "SFX",
 }
+
+local SOUND_PATH = "Interface\\AddOns\\AbsorbWatch\\Sounds\\"
+local SOUNDS = { -- key -> label (files are Sounds\<key>.wav)
+  { "BubblePop", "Bubble pop" },
+  { "SoftPop", "Soft pop" },
+  { "Bloop", "Bloop" },
+  { "Off", "Off" },
+}
+local CHANNELS = { "Master", "SFX", "Dialog", "Ambience" }
 
 local db
 local playerDisplay
@@ -157,6 +168,63 @@ local function ScanCompactFrames()
 end
 
 ------------------------------------------------------------------------------------------------
+-- Pop sound when the player's absorb runs out
+------------------------------------------------------------------------------------------------
+-- The absorb is secret (on Forever even out of combat), so we can't compare it. Instead an invisible 0..1
+-- StatusBar gets the absorb as its value: its fill is 0 px wide at 0 absorb and full width at >= 1, so a frame
+-- anchored to the fill gets OnSizeChanged exactly when the absorb crosses zero, in either direction.
+-- Changes alternate, so we flip our state on each one. Since the game can occasionally skip or double one (seen
+-- around death), we resync now and then: force the gate empty with a plain 0, wait for that layout, reset our
+-- state to "no absorb", then feed the real absorb again -- if there is one, that registers as "up" (no sound).
+local hasAbsorb = false -- mirrors the gate: empty (false) / full (true)
+local popArmed = false
+local lastPop = 0
+local popGate
+
+local function PlayPop()
+  local now = GetTime()
+  if now - lastPop < 0.3 then return end
+  lastPop = now
+  if db.popSound ~= "Off" then
+    PlaySoundFile(SOUND_PATH .. db.popSound .. ".wav", db.popChannel)
+  end
+end
+
+local function BuildPopWatcher()
+  popGate = CreateFrame("StatusBar", nil, UIParent)
+  popGate:SetSize(4, 4)
+  popGate:SetPoint("BOTTOMLEFT")
+  popGate:SetAlpha(0) -- still laid out (and so still fires OnSizeChanged), just not drawn
+  popGate:SetStatusBarTexture(TEX)
+  popGate:SetMinMaxValues(0, 1)
+  popGate:SetValue(0)
+  local watcher = CreateFrame("Frame", nil, popGate)
+  local fill = popGate:GetStatusBarTexture()
+  watcher:SetPoint("TOPLEFT", fill, "TOPLEFT")
+  watcher:SetPoint("BOTTOMRIGHT", fill, "BOTTOMRIGHT")
+  watcher:SetScript("OnSizeChanged", function()
+    -- Don't touch the (possibly secret) size arguments; the event itself is the signal.
+    if not popArmed then return end
+    hasAbsorb = not hasAbsorb
+    if not hasAbsorb then PlayPop() end
+  end)
+end
+
+local function ResyncPop()
+  if not popGate then return end
+  popArmed = false
+  popGate:SetValue(0)
+  -- Two frames: make sure the forced-empty layout (and its OnSizeChanged) has happened while disarmed.
+  C_Timer.After(0, function()
+    C_Timer.After(0, function()
+      hasAbsorb = false
+      popArmed = true
+      popGate:SetValue(UnitGetTotalAbsorbs("player") or 0)
+    end)
+  end)
+end
+
+------------------------------------------------------------------------------------------------
 -- Update / refresh
 ------------------------------------------------------------------------------------------------
 local function SetTextSafe(fs, v)
@@ -170,8 +238,9 @@ local function Update()
   if not db then return end
   if playerDisplay then UpdateDisplay(playerDisplay) end
   for _, d in pairs(raidDisplays) do UpdateDisplay(d) end
+  local absorb = UnitGetTotalAbsorbs("player") or 0
+  if popGate and popArmed then popGate:SetValue(absorb) end
   if db.text then
-    local absorb = UnitGetTotalAbsorbs("player") or 0
     SetTextSafe(text.fs, absorb)
     if not pcall(text.gate.SetValue, text.gate, absorb) then text.gate:SetValue(1) end
   end
@@ -211,6 +280,8 @@ local function Build()
   fs:SetTextColor(1, 0.85, 0.3)
   text = { frame = tf, fs = fs, gate = gate }
 
+  BuildPopWatcher()
+
   -- Pick up compact frames as Blizzard assigns units to them (covers frames created later, e.g. joining a raid).
   if CompactUnitFrame_SetUnit then
     hooksecurefunc("CompactUnitFrame_SetUnit", function(frame) TrackCompactFrame(frame) end)
@@ -224,10 +295,10 @@ local function RegisterSettings()
   if not (Settings and Settings.RegisterVerticalLayoutCategory) then return end
   local category = Settings.RegisterVerticalLayoutCategory("AbsorbWatch")
 
-  local function Add(key, name, tooltip, options)
+  local function Add(key, name, tooltip, options, onChange)
     local setting = Settings.RegisterAddOnSetting(category, "AbsorbWatch_" .. key, key, AbsorbWatchDB,
       type(DEFAULTS[key]), name, DEFAULTS[key])
-    setting:SetValueChangedCallback(Refresh)
+    setting:SetValueChangedCallback(onChange or Refresh)
     if options then
       Settings.CreateDropdown(category, setting, options, tooltip)
     else
@@ -248,6 +319,21 @@ local function RegisterSettings()
   Add("raid", "Show on raid frames",
     "Also draw absorbs on raid frames and raid-style party frames.")
   Add("text", "Show absorb amount", "Show your total absorb as a number to the right of your health bar. Hidden when you have no absorb.")
+
+  -- Changing either sound setting plays a preview.
+  local function Preview() lastPop = 0; PlayPop() end
+  Add("popSound", "Shield break sound", "Sound to play when your absorb shields run out (broken or expired).",
+    function()
+      local c = Settings.CreateControlTextContainer()
+      for _, s in ipairs(SOUNDS) do c:Add(s[1], s[2]) end
+      return c:GetData()
+    end, Preview)
+  Add("popChannel", "Shield break sound channel", "Which volume slider controls the shield break sound.",
+    function()
+      local c = Settings.CreateControlTextContainer()
+      for _, ch in ipairs(CHANNELS) do c:Add(ch, ch) end
+      return c:GetData()
+    end, Preview)
 
   Settings.RegisterAddOnCategory(category)
 end
@@ -273,11 +359,21 @@ ev:SetScript("OnEvent", function(self, event, arg1)
     self:RegisterEvent("UNIT_HEALTH") -- excess-only range depends on missing health
     -- Safety net in case an event is missed (or a frame's unit changes without one).
     C_Timer.NewTicker(0.25, Update)
+    -- Pop-tracking resyncs: on state changes that can confuse it, and periodically as a fallback.
+    for _, e in ipairs({ "PLAYER_DEAD", "PLAYER_ALIVE", "PLAYER_UNGHOST", "PLAYER_REGEN_ENABLED" }) do
+      self:RegisterEvent(e)
+    end
+    C_Timer.NewTicker(10, ResyncPop)
+    C_Timer.After(1, ResyncPop) -- first arm, once the empty initial layout has settled
     Refresh()
     return
   end
   if event == "PLAYER_ENTERING_WORLD" or event == "GROUP_ROSTER_UPDATE" then
     Refresh()
+    if event == "PLAYER_ENTERING_WORLD" then ResyncPop() end
+  elseif event == "PLAYER_DEAD" or event == "PLAYER_ALIVE" or event == "PLAYER_UNGHOST"
+      or event == "PLAYER_REGEN_ENABLED" then
+    ResyncPop()
   else
     Update()
   end
